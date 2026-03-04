@@ -155,6 +155,7 @@ function buildQuestionModal(question, sessionId, questionNumber) {
   return {
     type: 'modal',
     callback_id: 'quiz_answer',
+    notify_on_close: true,
     private_metadata: JSON.stringify({ sessionId, currentQuestionId: q.id }),
     title: { type: 'plain_text', text: 'Pricing Quiz' },
     submit: { type: 'plain_text', text: 'Submit Answer' },
@@ -269,6 +270,7 @@ function buildFeedbackModal(isCorrect, question, sessionId, nextIndex, isLastQue
   return {
     type: 'modal',
     callback_id: 'quiz_feedback',
+    notify_on_close: true,
     private_metadata: JSON.stringify({ sessionId, nextIndex, isLastQuestion, nextQuestionId }),
     title: { type: 'plain_text', text: 'Pricing Quiz' },
     submit: { type: 'plain_text', text: isLastQuestion ? 'See Results' : 'Next Question' },
@@ -610,6 +612,29 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
     console.error('Error in quiz_feedback:', err);
     await ack({ response_action: 'update', view: errorModal('An unexpected error occurred. Please restart with /pricing-quiz.') });
   }
+});
+
+// ── VIEW CLOSE: free up slot immediately when user exits early ────────────────
+
+async function cleanupSession(view) {
+  try {
+    const { sessionId } = JSON.parse(view.private_metadata || '{}');
+    if (sessionId) {
+      await supabase.from('quiz_sessions').delete().eq('id', sessionId).eq('completed', false);
+    }
+  } catch (err) {
+    console.error('Error cleaning up session on close:', err);
+  }
+}
+
+app.view({ callback_id: 'quiz_answer', type: 'view_closed' }, async ({ ack, view }) => {
+  await ack();
+  await cleanupSession(view);
+});
+
+app.view({ callback_id: 'quiz_feedback', type: 'view_closed' }, async ({ ack, view }) => {
+  await ack();
+  await cleanupSession(view);
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
