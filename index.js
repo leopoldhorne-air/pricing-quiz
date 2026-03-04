@@ -20,6 +20,33 @@ const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
+// Retry wrapper — retries up to 2x with exponential backoff
+async function withRetry(fn, retries = 2, delay = 300) {
+  for (let i = 0; i <= retries; i++) {
+    try { return await fn(); }
+    catch (err) {
+      if (i === retries) throw err;
+      await new Promise(r => setTimeout(r, delay * (i + 1)));
+    }
+  }
+}
+
+// In-memory question cache — avoids a DB round-trip on every answer submission
+let questionsCache = null;
+let questionsCacheTime = 0;
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function getQuestionsCache() {
+  if (questionsCache && Date.now() - questionsCacheTime < CACHE_TTL) {
+    return questionsCache;
+  }
+  const { data, error } = await supabase.from('questions').select('*, personas(name, title, image_url)');
+  if (error) throw new Error(`Failed to load question cache: ${error.message}`);
+  questionsCache = new Map(data.map(q => [q.id, normalizeQuestion(q)]));
+  questionsCacheTime = Date.now();
+  return questionsCache;
+}
+
 async function getRandomQuestions(n = 10) {
   const { data, error } = await supabase.rpc('get_random_questions', { n });
   if (error) throw new Error(`Failed to fetch questions: ${error.message}`);
@@ -126,7 +153,7 @@ function buildQuestionModal(question, sessionId, questionNumber) {
   return {
     type: 'modal',
     callback_id: 'quiz_answer',
-    private_metadata: JSON.stringify({ sessionId }),
+    private_metadata: JSON.stringify({ sessionId, currentQuestionId: q.id }),
     title: { type: 'plain_text', text: 'Pricing Quiz' },
     submit: { type: 'plain_text', text: 'Submit Answer' },
     blocks,
@@ -321,15 +348,13 @@ app.command('/pricing-quiz', async ({ command, ack, client }) => {
   const userId = command.user_id;
 
   try {
-    // Clean up any incomplete session for this user
-    await supabase
-      .from('quiz_sessions')
-      .delete()
-      .eq('user_id', userId)
-      .eq('completed', false);
-
-    // Fetch 10 random questions
-    const questions = await getRandomQuestions(10);
+    // Parallel: clean up old session + fetch random questions
+    const [, questions] = await Promise.all([
+      withRetry(() =>
+        supabase.from('quiz_sessions').delete().eq('user_id', userId).eq('completed', false)
+      ),
+      getRandomQuestions(10),
+    ]);
 
     if (!questions || questions.length < 10) {
       await client.chat.postEphemeral({
@@ -343,18 +368,16 @@ app.command('/pricing-quiz', async ({ command, ack, client }) => {
     const questionIds = questions.map(q => q.id);
 
     // Create quiz session
-    const { data: session, error: sessionError } = await supabase
-      .from('quiz_sessions')
-      .insert({
+    const { data: session, error: sessionError } = await withRetry(() =>
+      supabase.from('quiz_sessions').insert({
         user_id: userId,
         question_ids: questionIds,
         current_index: 0,
         answers: [],
         started_at: new Date().toISOString(),
         completed: false,
-      })
-      .select()
-      .single();
+      }).select().single()
+    );
 
     if (sessionError) throw sessionError;
 
@@ -378,7 +401,7 @@ app.command('/pricing-quiz', async ({ command, ack, client }) => {
 
 app.view('quiz_answer', async ({ ack, view, body, client }) => {
   const userId = body.user.id;
-  const { sessionId } = JSON.parse(view.private_metadata);
+  const { sessionId, currentQuestionId } = JSON.parse(view.private_metadata);
 
   // Extract submitted answer
   const answerBlock = view.state.values['answer_block'];
@@ -390,27 +413,21 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
   }
 
   try {
-    // Load session
-    const { data: session, error: sessionError } = await supabase
-      .from('quiz_sessions')
-      .select('*')
-      .eq('id', sessionId)
-      .single();
+    // Load session + question cache IN PARALLEL — cuts sequential DB ops to 1
+    const [sessionResult, questionsMap] = await Promise.all([
+      withRetry(() => supabase.from('quiz_sessions').select('*').eq('id', sessionId).single()),
+      getQuestionsCache(),
+    ]);
 
+    const { data: session, error: sessionError } = sessionResult;
     if (sessionError || !session) {
       return await ack({ response_action: 'update', view: errorModal('Session not found. Please restart with /pricing-quiz.') });
     }
 
     const currentIndex = session.current_index;
+    const currentQuestion = questionsMap.get(currentQuestionId);
 
-    // Load current question (with persona)
-    const { data: currentQuestion, error: qError } = await supabase
-      .from('questions')
-      .select('*, personas(name, title, image_url)')
-      .eq('id', session.question_ids[currentIndex])
-      .single();
-
-    if (qError || !currentQuestion) {
+    if (!currentQuestion) {
       return await ack({ response_action: 'update', view: errorModal('Question not found. Please restart with /pricing-quiz.') });
     }
 
@@ -438,14 +455,13 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
     const nextIndex = currentIndex + 1;
     const isLastQuestion = nextIndex >= 10;
 
-    // Update session with answer and advance index
-    await supabase
-      .from('quiz_sessions')
-      .update({ current_index: nextIndex, answers: updatedAnswers })
-      .eq('id', sessionId);
-
-    // Pass nextQuestionId in metadata so quiz_feedback skips a DB round-trip
+    // Fire-and-forget session update — don't block ack waiting for the write
     const nextQuestionId = !isLastQuestion ? session.question_ids[nextIndex] : null;
+    withRetry(() =>
+      supabase.from('quiz_sessions')
+        .update({ current_index: nextIndex, answers: updatedAnswers })
+        .eq('id', sessionId)
+    ).catch(err => console.error('Session update failed:', err));
 
     // Show feedback (correct/incorrect + explanation if wrong)
     return await ack({
@@ -484,13 +500,13 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
       });
 
     } else {
-      // Quiz complete — load session and calculate score
-      const { data: session, error: sessionError } = await supabase
-        .from('quiz_sessions')
-        .select('*')
-        .eq('id', sessionId)
-        .single();
+      // Quiz complete — round 1: session + user info IN PARALLEL
+      const [sessionResult, userInfoResult] = await Promise.all([
+        withRetry(() => supabase.from('quiz_sessions').select('*').eq('id', sessionId).single()),
+        client.users.info({ user: userId }).catch(() => null),
+      ]);
 
+      const { data: session, error: sessionError } = sessionResult;
       if (sessionError || !session) {
         return await ack({ response_action: 'update', view: errorModal('Session not found.') });
       }
@@ -503,30 +519,24 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
       );
       const correctCount = session.answers.filter(a => a.isCorrect).length;
       const score = calculateScore(correctCount, totalSeconds);
+      const userName = userInfoResult?.user?.real_name || userInfoResult?.user?.name || body.user.name;
 
-      // Get user's real display name
-      let userName = body.user.name;
-      try {
-        const userInfo = await client.users.info({ user: userId });
-        userName = userInfo.user.real_name || userInfo.user.name;
-      } catch (e) {
-        console.warn('Could not fetch user display name, using handle instead.');
-      }
-
-      // Mark session complete and save score
-      await supabase
-        .from('quiz_sessions')
-        .update({ completed: true })
-        .eq('id', sessionId);
-
-      await supabase.from('scores').insert({
-        user_id: userId,
-        user_name: userName,
-        correct_count: correctCount,
-        total_seconds: totalSeconds,
-        final_score: score.finalScore,
-        completed_at: new Date().toISOString(),
-      });
+      // Round 2: session update + score insert IN PARALLEL
+      await Promise.all([
+        withRetry(() =>
+          supabase.from('quiz_sessions').update({ completed: true }).eq('id', sessionId)
+        ),
+        withRetry(() =>
+          supabase.from('scores').insert({
+            user_id: userId,
+            user_name: userName,
+            correct_count: correctCount,
+            total_seconds: totalSeconds,
+            final_score: score.finalScore,
+            completed_at: new Date().toISOString(),
+          })
+        ),
+      ]);
 
       // Show results modal
       await ack({
@@ -549,6 +559,7 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
 
 (async () => {
   await app.start();
+  await getQuestionsCache(); // pre-warm so first user never waits
   console.log('⚡ Pricing Quiz bot is running!');
 })();
 
