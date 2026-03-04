@@ -196,7 +196,7 @@ function buildResultsModal(correctCount, totalSeconds, score) {
   };
 }
 
-function buildFeedbackModal(isCorrect, question, sessionId, nextIndex, isLastQuestion) {
+function buildFeedbackModal(isCorrect, question, sessionId, nextIndex, isLastQuestion, nextQuestionId) {
   const blocks = [];
 
   // Result header
@@ -240,7 +240,7 @@ function buildFeedbackModal(isCorrect, question, sessionId, nextIndex, isLastQue
   return {
     type: 'modal',
     callback_id: 'quiz_feedback',
-    private_metadata: JSON.stringify({ sessionId, nextIndex, isLastQuestion }),
+    private_metadata: JSON.stringify({ sessionId, nextIndex, isLastQuestion, nextQuestionId }),
     title: { type: 'plain_text', text: 'Pricing Quiz' },
     submit: { type: 'plain_text', text: isLastQuestion ? 'See Results' : 'Next Question' },
     blocks,
@@ -444,10 +444,13 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
       .update({ current_index: nextIndex, answers: updatedAnswers })
       .eq('id', sessionId);
 
+    // Pass nextQuestionId in metadata so quiz_feedback skips a DB round-trip
+    const nextQuestionId = !isLastQuestion ? session.question_ids[nextIndex] : null;
+
     // Show feedback (correct/incorrect + explanation if wrong)
     return await ack({
       response_action: 'update',
-      view: buildFeedbackModal(isCorrect, currentQuestion, sessionId, nextIndex, isLastQuestion),
+      view: buildFeedbackModal(isCorrect, currentQuestion, sessionId, nextIndex, isLastQuestion, nextQuestionId),
     });
 
   } catch (err) {
@@ -460,25 +463,15 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
 
 app.view('quiz_feedback', async ({ ack, view, body, client }) => {
   const userId = body.user.id;
-  const { sessionId, nextIndex, isLastQuestion } = JSON.parse(view.private_metadata);
+  const { sessionId, nextIndex, isLastQuestion, nextQuestionId } = JSON.parse(view.private_metadata);
 
   try {
     if (!isLastQuestion) {
-      // Load session to get question IDs
-      const { data: session, error: sessionError } = await supabase
-        .from('quiz_sessions')
-        .select('question_ids')
-        .eq('id', sessionId)
-        .single();
-
-      if (sessionError || !session) {
-        return await ack({ response_action: 'update', view: errorModal('Session not found. Please restart with /pricing-quiz.') });
-      }
-
+      // nextQuestionId was passed in metadata — no session fetch needed
       const { data: nextQuestion, error: nextQError } = await supabase
         .from('questions')
         .select('*, personas(name, title, image_url)')
-        .eq('id', session.question_ids[nextIndex])
+        .eq('id', nextQuestionId)
         .single();
 
       if (nextQError || !nextQuestion) {
