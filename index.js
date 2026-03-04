@@ -558,3 +558,14 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
   await app.start();
   console.log('⚡ Pricing Quiz bot is running!');
 })();
+
+// ── HEALTH CHECK SERVER (required for Render port binding) ────────────────────
+
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('OK');
+});
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`Health check server listening on port ${process.env.PORT || 3000}`);
+});
