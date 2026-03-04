@@ -17,6 +17,8 @@ const supabase = createClient(
 );
 
 const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
+const MAX_CONCURRENT_SESSIONS = 20;   // ← change this to raise/lower the cap
+const STALE_SESSION_MINUTES   = 30;   // sessions older than this count as abandoned
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -342,19 +344,36 @@ async function postScoreToChannel(userId, userName, correctCount, totalSeconds, 
 
 // ── COMMAND: /pricing-quiz ────────────────────────────────────────────────────
 
-app.command('/pricing-quiz', async ({ command, ack, client }) => {
+app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
   await ack();
 
   const userId = command.user_id;
 
   try {
-    // Parallel: clean up old session + fetch random questions
-    const [, questions] = await Promise.all([
-      withRetry(() =>
-        supabase.from('quiz_sessions').delete().eq('user_id', userId).eq('completed', false)
-      ),
+    // Step 1: delete this user's orphaned sessions FIRST so they don't count toward the cap
+    await withRetry(() =>
+      supabase.from('quiz_sessions').delete().eq('user_id', userId).eq('completed', false)
+    );
+
+    // Step 2: parallel — check active session count + fetch random questions
+    const staleThreshold = new Date(Date.now() - STALE_SESSION_MINUTES * 60 * 1000).toISOString();
+    const [countResult, questions] = await Promise.all([
+      supabase
+        .from('quiz_sessions')
+        .select('*', { count: 'exact', head: true })
+        .eq('completed', false)
+        .gte('started_at', staleThreshold),
       getRandomQuestions(10),
     ]);
+
+    const activeCount = countResult.count ?? 0;
+    if (activeCount >= MAX_CONCURRENT_SESSIONS) {
+      await respond({
+        response_type: 'ephemeral',
+        text: `⏳ The quiz is at capacity right now — ${MAX_CONCURRENT_SESSIONS} people are already taking it. Leo didn't want to spend money on infra. Try again in a few minutes!`,
+      });
+      return;
+    }
 
     if (!questions || questions.length < 10) {
       await client.chat.postEphemeral({
@@ -394,6 +413,44 @@ app.command('/pricing-quiz', async ({ command, ack, client }) => {
       user: userId,
       text: ':warning: Something went wrong starting the quiz. Please try again.',
     });
+  }
+});
+
+// ── COMMAND: /quiz-status ─────────────────────────────────────────────────────
+
+app.command('/quiz-status', async ({ command, ack, respond }) => {
+  await ack();
+
+  try {
+    const staleThreshold = new Date(Date.now() - STALE_SESSION_MINUTES * 60 * 1000).toISOString();
+    const { count, error } = await supabase
+      .from('quiz_sessions')
+      .select('*', { count: 'exact', head: true })
+      .eq('completed', false)
+      .gte('started_at', staleThreshold);
+
+    if (error) throw error;
+
+    const active = count ?? 0;
+    const remaining = Math.max(0, MAX_CONCURRENT_SESSIONS - active);
+    const bar = '█'.repeat(active) + '░'.repeat(Math.max(0, MAX_CONCURRENT_SESSIONS - active));
+
+    await respond({
+      response_type: 'ephemeral',
+      text: `Quiz status: ${active}/${MAX_CONCURRENT_SESSIONS} active`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*📊 Quiz Status*\n\`${bar}\`\n*${active} / ${MAX_CONCURRENT_SESSIONS}* active sessions — *${remaining} spot${remaining === 1 ? '' : 's'} open*`,
+          },
+        },
+      ],
+    });
+  } catch (err) {
+    console.error('Error fetching quiz status:', err);
+    await respond({ response_type: 'ephemeral', text: ':warning: Could not fetch quiz status.' });
   }
 });
 
