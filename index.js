@@ -36,17 +36,24 @@ async function withRetry(fn, retries = 2, delay = 300) {
 // In-memory question cache — avoids a DB round-trip on every answer submission
 let questionsCache = null;
 let questionsCacheTime = 0;
+let questionsCacheRefresh = null; // in-flight promise — prevents cache stampede
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 async function getQuestionsCache() {
   if (questionsCache && Date.now() - questionsCacheTime < CACHE_TTL) {
     return questionsCache;
   }
-  const { data, error } = await supabase.from('questions').select('*, personas(name, title, image_url)');
-  if (error) throw new Error(`Failed to load question cache: ${error.message}`);
-  questionsCache = new Map(data.map(q => [q.id, normalizeQuestion(q)]));
-  questionsCacheTime = Date.now();
-  return questionsCache;
+  // If a refresh is already in flight, share it — don't fire another DB query
+  if (questionsCacheRefresh) return questionsCacheRefresh;
+  questionsCacheRefresh = (async () => {
+    const { data, error } = await supabase.from('questions').select('*, personas(name, title, image_url)');
+    if (error) throw new Error(`Failed to load question cache: ${error.message}`);
+    questionsCache = new Map(data.map(q => [q.id, normalizeQuestion(q)]));
+    questionsCacheTime = Date.now();
+    questionsCacheRefresh = null;
+    return questionsCache;
+  })();
+  return questionsCacheRefresh;
 }
 
 async function getRandomQuestions(n = 10) {
@@ -101,7 +108,7 @@ function normalizeQuestion(q) {
   };
 }
 
-function buildQuestionModal(question, sessionId, questionNumber) {
+function buildQuestionModal(question, sessionId, questionNumber, question_ids, answers, started_at) {
   const q = normalizeQuestion(question);
   const blocks = [];
 
@@ -156,7 +163,7 @@ function buildQuestionModal(question, sessionId, questionNumber) {
     type: 'modal',
     callback_id: 'quiz_answer',
     notify_on_close: true,
-    private_metadata: JSON.stringify({ sessionId, currentQuestionId: q.id }),
+    private_metadata: JSON.stringify({ sessionId, currentQuestionId: q.id, currentIndex: questionNumber - 1, question_ids, answers, started_at }),
     title: { type: 'plain_text', text: 'Pricing Quiz' },
     submit: { type: 'plain_text', text: 'Submit Answer' },
     blocks,
@@ -226,7 +233,7 @@ function buildResultsModal(correctCount, totalSeconds, score) {
   };
 }
 
-function buildFeedbackModal(isCorrect, question, sessionId, nextIndex, isLastQuestion, nextQuestionId) {
+function buildFeedbackModal(isCorrect, question, sessionId, nextIndex, isLastQuestion, nextQuestionId, question_ids, answers, started_at) {
   const blocks = [];
 
   // Result header
@@ -271,7 +278,7 @@ function buildFeedbackModal(isCorrect, question, sessionId, nextIndex, isLastQue
     type: 'modal',
     callback_id: 'quiz_feedback',
     notify_on_close: true,
-    private_metadata: JSON.stringify({ sessionId, nextIndex, isLastQuestion, nextQuestionId }),
+    private_metadata: JSON.stringify({ sessionId, nextIndex, isLastQuestion, nextQuestionId, question_ids, answers, started_at }),
     title: { type: 'plain_text', text: 'Pricing Quiz' },
     submit: { type: 'plain_text', text: isLastQuestion ? 'See Results' : 'Next Question' },
     blocks,
@@ -387,6 +394,7 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
     }
 
     const questionIds = questions.map(q => q.id);
+    const started_at = new Date().toISOString();
 
     // Create quiz session
     const { data: session, error: sessionError } = await withRetry(() =>
@@ -395,17 +403,17 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
         question_ids: questionIds,
         current_index: 0,
         answers: [],
-        started_at: new Date().toISOString(),
+        started_at,
         completed: false,
       }).select().single()
     );
 
     if (sessionError) throw sessionError;
 
-    // Open modal with first question
+    // Open modal — pass question_ids, answers, started_at so quiz never needs to read DB again
     await client.views.open({
       trigger_id: command.trigger_id,
-      view: buildQuestionModal(questions[0], session.id, 1),
+      view: buildQuestionModal(questions[0], session.id, 1, questionIds, [], started_at),
     });
 
   } catch (err) {
@@ -460,7 +468,7 @@ app.command('/quiz-status', async ({ command, ack, respond }) => {
 
 app.view('quiz_answer', async ({ ack, view, body, client }) => {
   const userId = body.user.id;
-  const { sessionId, currentQuestionId } = JSON.parse(view.private_metadata);
+  const { sessionId, currentQuestionId, currentIndex, question_ids, answers, started_at } = JSON.parse(view.private_metadata);
 
   // Extract submitted answer
   const answerBlock = view.state.values['answer_block'];
@@ -472,18 +480,8 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
   }
 
   try {
-    // Load session + question cache IN PARALLEL — cuts sequential DB ops to 1
-    const [sessionResult, questionsMap] = await Promise.all([
-      withRetry(() => supabase.from('quiz_sessions').select('*').eq('id', sessionId).single()),
-      getQuestionsCache(),
-    ]);
-
-    const { data: session, error: sessionError } = sessionResult;
-    if (sessionError || !session) {
-      return await ack({ response_action: 'update', view: errorModal('Session not found. Please restart with /pricing-quiz.') });
-    }
-
-    const currentIndex = session.current_index;
+    // Question from cache — instant memory lookup, zero DB calls
+    const questionsMap = await getQuestionsCache();
     const currentQuestion = questionsMap.get(currentQuestionId);
 
     if (!currentQuestion) {
@@ -500,11 +498,11 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
       isCorrect = !isNaN(submitted) && !isNaN(correct) && submitted === correct;
     }
 
-    // Append answer to session
+    // Build updated answers from metadata — no DB read needed
     const updatedAnswers = [
-      ...session.answers,
+      ...answers,
       {
-        questionId: session.question_ids[currentIndex],
+        questionId: currentQuestionId,
         submitted: submittedAnswer,
         correct: currentQuestion.correct,
         isCorrect,
@@ -513,19 +511,19 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
 
     const nextIndex = currentIndex + 1;
     const isLastQuestion = nextIndex >= 10;
+    const nextQuestionId = !isLastQuestion ? question_ids[nextIndex] : null;
 
-    // Fire-and-forget session update — don't block ack waiting for the write
-    const nextQuestionId = !isLastQuestion ? session.question_ids[nextIndex] : null;
+    // Fire-and-forget session update — never blocks ack()
     withRetry(() =>
       supabase.from('quiz_sessions')
         .update({ current_index: nextIndex, answers: updatedAnswers })
         .eq('id', sessionId)
     ).catch(err => console.error('Session update failed:', err));
 
-    // Show feedback (correct/incorrect + explanation if wrong)
+    // ack() with zero DB calls made — purely in-memory
     return await ack({
       response_action: 'update',
-      view: buildFeedbackModal(isCorrect, currentQuestion, sessionId, nextIndex, isLastQuestion, nextQuestionId),
+      view: buildFeedbackModal(isCorrect, currentQuestion, sessionId, nextIndex, isLastQuestion, nextQuestionId, question_ids, updatedAnswers, started_at),
     });
 
   } catch (err) {
@@ -538,11 +536,11 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
 
 app.view('quiz_feedback', async ({ ack, view, body, client }) => {
   const userId = body.user.id;
-  const { sessionId, nextIndex, isLastQuestion, nextQuestionId } = JSON.parse(view.private_metadata);
+  const { sessionId, nextIndex, isLastQuestion, nextQuestionId, question_ids, answers, started_at } = JSON.parse(view.private_metadata);
 
   try {
     if (!isLastQuestion) {
-      // Use in-memory cache — zero DB calls before ack()
+      // Question from cache + state from metadata — zero DB calls before ack()
       const questionsMap = await getQuestionsCache();
       const nextQuestion = questionsMap.get(nextQuestionId);
 
@@ -552,57 +550,48 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
 
       return await ack({
         response_action: 'update',
-        view: buildQuestionModal(nextQuestion, sessionId, nextIndex + 1),
+        view: buildQuestionModal(nextQuestion, sessionId, nextIndex + 1, question_ids, answers, started_at),
       });
 
     } else {
-      // Quiz complete — round 1: session + user info IN PARALLEL
-      const [sessionResult, userInfoResult] = await Promise.all([
-        withRetry(() => supabase.from('quiz_sessions').select('*').eq('id', sessionId).single()),
-        client.users.info({ user: userId }).catch(() => null),
-      ]);
-
-      const { data: session, error: sessionError } = sessionResult;
-      if (sessionError || !session) {
-        return await ack({ response_action: 'update', view: errorModal('Session not found.') });
-      }
-
-      const startedAt = session.started_at.endsWith('Z')
-        ? session.started_at
-        : session.started_at + 'Z';
-      const totalSeconds = Math.floor(
-        (Date.now() - new Date(startedAt).getTime()) / 1000
-      );
-      const correctCount = session.answers.filter(a => a.isCorrect).length;
+      // Quiz complete — calculate score from metadata, zero DB/API before ack()
+      const startedAt = started_at.endsWith('Z') ? started_at : started_at + 'Z';
+      const totalSeconds = Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000);
+      const correctCount = answers.filter(a => a.isCorrect).length;
       const score = calculateScore(correctCount, totalSeconds);
-      const userName = userInfoResult?.user?.real_name || userInfoResult?.user?.name || body.user.name;
 
-      // Round 2: session update + score insert IN PARALLEL
-      await Promise.all([
-        withRetry(() =>
-          supabase.from('quiz_sessions').update({ completed: true }).eq('id', sessionId)
-        ),
-        withRetry(() =>
-          supabase.from('scores').insert({
-            user_id: userId,
-            user_name: userName,
-            correct_count: correctCount,
-            total_seconds: totalSeconds,
-            final_score: score.finalScore,
-            completed_at: new Date().toISOString(),
-          })
-        ),
-      ]);
-
-      // Show results modal
+      // ack() IMMEDIATELY — results shown with zero blocking operations
       await ack({
         response_action: 'update',
         view: buildResultsModal(correctCount, totalSeconds, score),
       });
 
-      // Post to channel (fire and forget — after ack)
-      postScoreToChannel(userId, userName, correctCount, totalSeconds, score.finalScore)
-        .catch(err => console.error('Error posting to leaderboard:', err));
+      // Fire-and-forget everything else after ack
+      (async () => {
+        try {
+          const userInfo = await client.users.info({ user: userId }).catch(() => null);
+          const userName = userInfo?.user?.real_name || userInfo?.user?.name || body.user.name;
+          await Promise.all([
+            withRetry(() =>
+              supabase.from('quiz_sessions').update({ completed: true }).eq('id', sessionId)
+            ),
+            withRetry(() =>
+              supabase.from('scores').insert({
+                user_id: userId,
+                user_name: userName,
+                correct_count: correctCount,
+                total_seconds: totalSeconds,
+                final_score: score.finalScore,
+                completed_at: new Date().toISOString(),
+              })
+            ),
+          ]);
+          postScoreToChannel(userId, userName, correctCount, totalSeconds, score.finalScore)
+            .catch(err => console.error('Error posting to leaderboard:', err));
+        } catch (err) {
+          console.error('Error finalizing quiz:', err);
+        }
+      })();
     }
 
   } catch (err) {
