@@ -542,14 +542,11 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
 
   try {
     if (!isLastQuestion) {
-      // nextQuestionId was passed in metadata — no session fetch needed
-      const { data: nextQuestion, error: nextQError } = await supabase
-        .from('questions')
-        .select('*, personas(name, title, image_url)')
-        .eq('id', nextQuestionId)
-        .single();
+      // Use in-memory cache — zero DB calls before ack()
+      const questionsMap = await getQuestionsCache();
+      const nextQuestion = questionsMap.get(nextQuestionId);
 
-      if (nextQError || !nextQuestion) {
+      if (!nextQuestion) {
         return await ack({ response_action: 'update', view: errorModal('Could not load next question. Please restart.') });
       }
 
