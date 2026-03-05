@@ -186,7 +186,7 @@ function formatTime(totalSeconds) {
 }
 
 function calculateScore(correctCount, totalSeconds) {
-  const accuracyScore = (correctCount / 10) * 100;
+  const accuracyScore = (correctCount / 10) * 300;
   // Speed bonus: 200 pts at 0s, 0 pts at 5:00 (300s), linear scale
   const speedBonus = Math.max(0, Math.round(200 * (300 - totalSeconds) / 300));
   const finalScore = Math.round(accuracyScore + speedBonus);
