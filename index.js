@@ -39,6 +39,10 @@ let questionsCacheTime = 0;
 let questionsCacheRefresh = null; // in-flight promise — prevents cache stampede
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+// In-flight submission tracker — prevents double-submits from rapid clicking
+// Key format: "sessionId:questionIndex" or "sessionId:feedback:nextIndex"
+const inFlightSubmissions = new Set();
+
 async function getQuestionsCache() {
   if (questionsCache && Date.now() - questionsCacheTime < CACHE_TTL) {
     return questionsCache;
@@ -479,6 +483,22 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
     submittedAnswer = answerBlock['text_value'].value?.trim();
   }
 
+  // Guard: no answer selected — clicked Submit before picking anything
+  if (!submittedAnswer) {
+    return await ack({
+      response_action: 'errors',
+      errors: { answer_block: 'Please select an answer before submitting.' },
+    });
+  }
+
+  // Guard: duplicate submission — clicked Submit twice before the modal updated
+  const submissionKey = `${sessionId}:${currentIndex}`;
+  if (inFlightSubmissions.has(submissionKey)) {
+    return await ack(); // silently no-op — already processing this question
+  }
+  inFlightSubmissions.add(submissionKey);
+  setTimeout(() => inFlightSubmissions.delete(submissionKey), 15000); // auto-expire
+
   try {
     // Question from cache — instant memory lookup, zero DB calls
     const questionsMap = await getQuestionsCache();
@@ -537,6 +557,14 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
 app.view('quiz_feedback', async ({ ack, view, body, client }) => {
   const userId = body.user.id;
   const { sessionId, nextIndex, isLastQuestion, nextQuestionId, question_ids, answers, started_at } = JSON.parse(view.private_metadata);
+
+  // Guard: duplicate tap — clicked "Next Question" or "See Results" twice before modal updated
+  const feedbackKey = `${sessionId}:feedback:${nextIndex}`;
+  if (inFlightSubmissions.has(feedbackKey)) {
+    return await ack(); // silently no-op
+  }
+  inFlightSubmissions.add(feedbackKey);
+  setTimeout(() => inFlightSubmissions.delete(feedbackKey), 15000); // auto-expire
 
   try {
     if (!isLastQuestion) {
