@@ -468,6 +468,51 @@ app.command('/quiz-status', async ({ command, ack, respond }) => {
   }
 });
 
+// ── COMMAND: /price-leaderboard ───────────────────────────────────────────────
+
+app.command('/price-leaderboard', async ({ command, ack, respond, client }) => {
+  await ack();
+
+  try {
+    const { data: topScores, error } = await supabase.rpc('get_top_scores', { limit_count: 10 });
+    if (error) throw error;
+
+    if (!topScores || topScores.length === 0) {
+      await respond({ response_type: 'ephemeral', text: 'No scores yet — be the first to take the quiz!' });
+      return;
+    }
+
+    const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
+    const leaderLines = topScores.map((s, i) =>
+      `${medals[i]} *${s.user_name}* — ${s.final_score} pts (${s.correct_count}/10 • ${formatTime(s.total_seconds)})`
+    );
+
+    await client.chat.postMessage({
+      channel: LEADERBOARD_CHANNEL_ID,
+      text: 'Pricing Quiz — Current Top 10',
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*🏅 Pricing Quiz — Top 10 Leaderboard*\n${leaderLines.join('\n')}`,
+          },
+        },
+        {
+          type: 'context',
+          elements: [{ type: 'mrkdwn', text: `Posted by <@${command.user_id}>` }],
+        },
+      ],
+    });
+
+    await respond({ response_type: 'ephemeral', text: '✅ Leaderboard posted!' });
+
+  } catch (err) {
+    console.error('Error posting leaderboard:', err);
+    await respond({ response_type: 'ephemeral', text: ':warning: Could not fetch the leaderboard. Please try again.' });
+  }
+});
+
 // ── VIEW: quiz_answer ─────────────────────────────────────────────────────────
 
 app.view('quiz_answer', async ({ ack, view, body, client }) => {
