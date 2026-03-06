@@ -361,14 +361,17 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
   await ack();
 
   const userId = command.user_id;
+  console.log(`[quiz:start] user=${userId}`);
 
   try {
     // Step 1: delete this user's orphaned sessions FIRST so they don't count toward the cap
+    console.log(`[quiz:start] step1 — cleanup orphaned sessions`);
     await withRetry(() =>
       supabase.from('quiz_sessions').delete().eq('user_id', userId).eq('completed', false)
     );
 
     // Step 2: parallel — check active session count + fetch random questions
+    console.log(`[quiz:start] step2 — count sessions + fetch questions`);
     const staleThreshold = new Date(Date.now() - STALE_SESSION_MINUTES * 60 * 1000).toISOString();
     const [countResult, questions] = await Promise.all([
       supabase
@@ -378,6 +381,8 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
         .gte('started_at', staleThreshold),
       getRandomQuestions(10),
     ]);
+
+    console.log(`[quiz:start] step2 done — activeCount=${countResult.count}, questions=${questions?.length}`);
 
     const activeCount = countResult.count ?? 0;
     if (activeCount >= MAX_CONCURRENT_SESSIONS) {
@@ -389,6 +394,7 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
     }
 
     if (!questions || questions.length < 10) {
+      console.warn(`[quiz:start] not enough questions: ${questions?.length}`);
       await client.chat.postEphemeral({
         channel: command.channel_id,
         user: userId,
@@ -401,6 +407,7 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
     const started_at = new Date().toISOString();
 
     // Create quiz session
+    console.log(`[quiz:start] step3 — insert session`);
     const { data: session, error: sessionError } = await withRetry(() =>
       supabase.from('quiz_sessions').insert({
         user_id: userId,
@@ -413,19 +420,22 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
     );
 
     if (sessionError) throw sessionError;
+    console.log(`[quiz:start] step3 done — sessionId=${session.id}`);
 
     // Open modal — pass question_ids, answers, started_at so quiz never needs to read DB again
+    console.log(`[quiz:start] step4 — opening modal`);
     await client.views.open({
       trigger_id: command.trigger_id,
       view: buildQuestionModal(questions[0], session.id, 1, questionIds, [], started_at),
     });
+    console.log(`[quiz:start] done — modal opened for user=${userId}`);
 
   } catch (err) {
-    console.error('Error starting quiz:', err);
+    console.error('[quiz:start] ERROR:', err?.message, err?.stack || String(err));
     await client.chat.postEphemeral({
       channel: command.channel_id,
       user: userId,
-      text: ':warning: Something went wrong starting the quiz. Please try again.',
+      text: `:warning: Something went wrong starting the quiz.\n\`\`\`${err?.message || String(err)}\`\`\``,
     });
   }
 });
@@ -546,10 +556,12 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
 
   try {
     // Question from cache — instant memory lookup, zero DB calls
+    console.log(`[quiz:answer] session=${sessionId} index=${currentIndex} questionId=${currentQuestionId}`);
     const questionsMap = await getQuestionsCache();
     const currentQuestion = questionsMap.get(currentQuestionId);
 
     if (!currentQuestion) {
+      console.error(`[quiz:answer] question not found in cache: ${currentQuestionId}`);
       return await ack({ response_action: 'update', view: errorModal('Question not found. Please restart with /pricing-quiz.') });
     }
 
@@ -594,7 +606,7 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
     });
 
   } catch (err) {
-    console.error('Error processing answer:', err);
+    console.error('[quiz:answer] ERROR:', err?.message, err?.stack || String(err));
     await ack({ response_action: 'update', view: errorModal('An unexpected error occurred. Please restart with /pricing-quiz.') });
   }
 });
@@ -614,12 +626,14 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
   setTimeout(() => inFlightSubmissions.delete(feedbackKey), 15000); // auto-expire
 
   try {
+    console.log(`[quiz:feedback] session=${sessionId} nextIndex=${nextIndex} isLastQuestion=${isLastQuestion}`);
     if (!isLastQuestion) {
       // Question from cache + state from metadata — zero DB calls before ack()
       const questionsMap = await getQuestionsCache();
       const nextQuestion = questionsMap.get(nextQuestionId);
 
       if (!nextQuestion) {
+        console.error(`[quiz:feedback] next question not found in cache: ${nextQuestionId}`);
         return await ack({ response_action: 'update', view: errorModal('Could not load next question. Please restart.') });
       }
 
@@ -670,7 +684,7 @@ app.view('quiz_feedback', async ({ ack, view, body, client }) => {
     }
 
   } catch (err) {
-    console.error('Error in quiz_feedback:', err);
+    console.error('[quiz:feedback] ERROR:', err?.message, err?.stack || String(err));
     await ack({ response_action: 'update', view: errorModal('An unexpected error occurred. Please restart with /pricing-quiz.') });
   }
 });
