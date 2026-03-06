@@ -513,7 +513,9 @@ app.view('quiz_answer', async ({ ack, view, body, client }) => {
     if (currentQuestion.type === 'multiple_choice') {
       isCorrect = submittedAnswer?.toUpperCase() === currentQuestion.correct?.toUpperCase();
     } else {
-      const submitted = parseFloat(submittedAnswer);
+      // Strip commas, dollar signs, spaces so "78,000" and "$78,000" match "78000"
+      const cleanAnswer = submittedAnswer.replace(/[$,\s]/g, '');
+      const submitted = parseFloat(cleanAnswer);
       const correct = parseFloat(currentQuestion.correct);
       isCorrect = !isNaN(submitted) && !isNaN(correct) && submitted === correct;
     }
