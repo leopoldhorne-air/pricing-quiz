@@ -74,6 +74,10 @@ function mcInputBlock(question) {
     { key: 'D', text: question.option_d },
   ].filter(o => o.text);
 
+  if (options.length === 0) {
+    throw new Error(`Question ${question.id} is type multiple_choice but has no options`);
+  }
+
   return {
     type: 'input',
     block_id: 'answer_block',
@@ -150,11 +154,13 @@ function buildQuestionModal(question, sessionId, questionNumber, question_ids, a
 
   blocks.push({ type: 'divider' });
 
-  // Scenario label + text
-  blocks.push({
-    type: 'section',
-    text: { type: 'mrkdwn', text: `*Scenario*\n${q.scenario}` },
-  });
+  // Scenario label + text (skip block entirely if null)
+  if (q.scenario) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `*Scenario*\n${q.scenario}` },
+    });
+  }
 
   // Answer input
   if (q.type === 'multiple_choice') {
@@ -364,10 +370,14 @@ app.command('/pricing-quiz', async ({ command, ack, respond, client }) => {
   console.log(`[quiz:start] user=${userId}`);
 
   try {
-    // Step 1: delete this user's orphaned sessions FIRST so they don't count toward the cap
+    // Step 1: delete this user's stale orphaned sessions — only >5 min old so we don't nuke an active session
     console.log(`[quiz:start] step1 — cleanup orphaned sessions`);
+    const userStaleThreshold = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     await withRetry(() =>
-      supabase.from('quiz_sessions').delete().eq('user_id', userId).eq('completed', false)
+      supabase.from('quiz_sessions').delete()
+        .eq('user_id', userId)
+        .eq('completed', false)
+        .lt('started_at', userStaleThreshold)
     );
 
     // Step 2: parallel — check active session count + fetch random questions
