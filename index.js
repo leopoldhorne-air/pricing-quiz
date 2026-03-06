@@ -85,10 +85,13 @@ function mcInputBlock(question) {
     element: {
       type: 'radio_buttons',
       action_id: 'selected_option',
-      options: options.map(o => ({
-        text: { type: 'plain_text', text: `${o.key}: ${o.text}` },
-        value: o.key,
-      })),
+      options: options.map(o => {
+        const label = `${o.key}: ${o.text}`;
+        return {
+          text: { type: 'plain_text', text: label.length > 150 ? label.slice(0, 147) + '...' : label },
+          value: o.key,
+        };
+      }),
     },
   };
 }
